@@ -1,0 +1,18 @@
+[Unit]
+Description=Neticks Backup Worker (Python)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/neticks-worker
+ExecStart=/usr/bin/python3 backup_worker.py
+Restart=always
+RestartSec=10
+Environment="AWS_REGION=us-east-2"
+Environment="SQS_BACKUP_QUEUE_URL=https://sqs.us-east-2.amazonaws.com/611474050854/backup_jobs"
+Environment="SQS_INDEX_QUEUE_URL=https://sqs.us-east-2.amazonaws.com/611474050854/index_jobs"
+Environment="MAX_WORKERS=3"
+
+[Install]
+WantedBy=multi-user.target
