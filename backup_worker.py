@@ -59,6 +59,8 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 AWS_REGION = os.getenv('AWS_REGION', 'us-east-2')
+# NOTE: SQS configuration is for backward compatibility with SQS-based workers
+# MySQL-based workers (mysql_backup_worker.py) don't use SQS - they read tasks from MySQL
 SQS_BACKUP_QUEUE_URL = os.getenv('SQS_BACKUP_QUEUE_URL', '')
 SQS_INDEX_QUEUE_URL = os.getenv('SQS_INDEX_QUEUE_URL', '')
 MAX_WORKERS = int(os.getenv('MAX_WORKERS', '3'))  # Process 3 jobs concurrently
@@ -66,7 +68,8 @@ POLL_WAIT_TIME = 20  # Long polling wait time
 VISIBILITY_TIMEOUT = 43200  # 12 hours (maximum allowed by SQS) - for enterprise backups
 VISIBILITY_EXTEND_INTERVAL = 3600  # Extend visibility every hour for long jobs
 
-# Initialize AWS clients
+# Initialize AWS clients (for SQS-based workers only)
+# MySQL-based workers use IAM role for S3 access (configured via EC2 instance profile)
 # Use explicit credentials from environment variables if available, otherwise use default (IAM role)
 aws_access_key = os.getenv('AWS_ACCESS_KEY_ID')
 aws_secret_key = os.getenv('AWS_SECRET_ACCESS_KEY')
@@ -373,7 +376,9 @@ def backup_gmail(s3_client, gmail_service, user_email: str, s3_config: Dict, ins
             label_page_token = None
             
             while True:
-                # Extend visibility timeout for long-running jobs
+                # Extend visibility timeout for long-running jobs (SQS-based workers only)
+                # NOTE: When called from mysql_backup_worker.py, receipt_handle and sqs_client_instance are None
+                # This code will be skipped for MySQL-based workers
                 if receipt_handle and sqs_client_instance and (time.time() - last_visibility_extend) >= VISIBILITY_EXTEND_INTERVAL:
                     try:
                         sqs_client_instance.change_message_visibility(
@@ -1036,7 +1041,9 @@ def backup_drive(s3_client, drive_service, user_email: str, s3_config: Dict, ins
         page_token = None
         
         while True:
-            # Extend visibility timeout for long-running jobs
+            # Extend visibility timeout for long-running jobs (SQS-based workers only)
+            # NOTE: When called from mysql_backup_worker.py, receipt_handle and sqs_client_instance are None
+            # This code will be skipped for MySQL-based workers
             if receipt_handle and sqs_client_instance and (time.time() - last_visibility_extend) >= VISIBILITY_EXTEND_INTERVAL:
                 try:
                     sqs_client_instance.change_message_visibility(
@@ -2502,11 +2509,36 @@ def send_index_messages(sqs_client, index_queue_url: str, instance_id: str, doma
             log_message(f"Error sending index message: {str(e)}", 'ERROR')
 
 def process_backup_job(job_data: Dict[str, Any], receipt_handle: Optional[str] = None, sqs_client_instance=None) -> bool:
-    """Process a single backup job - NO TIME LIMITS, can run for 10+ hours"""
+    """
+    Process a single backup job - NO TIME LIMITS, can run for 10+ hours
+    
+    Args:
+        job_data: Dictionary containing backup job information
+            - instance: Dictionary with instance configuration (S3, Google credentials, etc.)
+            - instance_id: Instance ID (can be at top level or inside instance dict)
+            - user_email: User email to backup
+            - domain: Domain name
+            - account_id: Account ID
+            - session_id: Session ID for this backup
+            - api_key: API key for endpoint communication
+            - api_base_url: API base URL (should be https://console.neticks.com/api)
+            - backup_requirements: Dictionary with backup requirements
+        receipt_handle: SQS receipt handle (for SQS-based workers, None for MySQL-based workers)
+        sqs_client_instance: SQS client instance (for SQS-based workers, None for MySQL-based workers)
+        
+    Returns:
+        True if backup completed successfully, False otherwise
+        
+    Note:
+        This function works with both SQS-based and MySQL-based task queues.
+        When called from mysql_backup_worker.py, receipt_handle and sqs_client_instance are None.
+        SQS visibility timeout extension code will be skipped in that case.
+    """
     try:
         instance = job_data.get('instance', {})
         user_email = job_data.get('user_email', '')
-        instance_id = instance.get('instance_id', '')
+        # Support both formats: instance_id at top level (MySQL worker) or inside instance dict (SQS worker)
+        instance_id = job_data.get('instance_id') or instance.get('instance_id', '')
         domain = job_data.get('domain', '')
         account_id = job_data.get('account_id', '')
         session_id = job_data.get('session_id', '')
@@ -2559,7 +2591,7 @@ def process_backup_job(job_data: Dict[str, Any], receipt_handle: Optional[str] =
         if not api_key or not api_base_url:
             log_message("❌ CRITICAL WARNING: No API key or API base URL in job_data", 'ERROR')
             log_message(f"Job data keys available: {list(job_data.keys())}", 'ERROR')
-            log_message("This means backup_launcher.php did not include API credentials in SQS message", 'ERROR')
+            log_message("This means backup_launcher.php did not include API credentials in task data", 'ERROR')
             log_message(f"Expected API base URL: https://console.neticks.com/api", 'ERROR')
             raise Exception("API credentials missing from job data")
         
